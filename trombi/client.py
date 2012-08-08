@@ -87,21 +87,21 @@ def _jsonize_params(params):
 
 def _exception(response):
     if response.code == 599:
-        return tromi_ex.get_exception_by_code(599, 'Unable to connect to CouchDB')
+        return trombi_ex.get_exception_by_code(599, 'Unable to connect to CouchDB')
         #return TrombiErrorResponse(599, 'Unable to connect to CouchDB')
     else:
         try:
             content = json.loads(response.body.decode('utf-8'))
         except ValueError:
-            return tromi_ex.get_exception_by_code(response.code, response.body)
+            return trombi_ex.get_exception_by_code(response.code, response.body)
             #return TrombiErrorResponse(response.code, response.body)
         else:
             try:
-                return tromi_ex.get_exception_by_code(response.code, content['reason'])
+                return trombi_ex.get_exception_by_code(response.code, content['reason'])
                 #return TrombiErrorResponse(response.code, content['reason'])
             except (KeyError, TypeError):
                 # TypeError is risen if the result is a list
-                return tromi_ex.get_exception_by_code(response.code, content)
+                return trombi_ex.get_exception_by_code(response.code, content)
                 #return TrombiErrorResponse(response.code, content)
 
 
@@ -189,7 +189,7 @@ class Server(object):
     def delete(self, name, callback):
         def _really_callback(response):
             if response.code == 200:
-                callback(True))
+                callback(json.loads(response.body.decode('utf-8')))
             elif response.code == 404:
                 raise trombi_ex.TrombiNotFound('Database does not exist: %r' % name)
             else:
@@ -296,7 +296,7 @@ class Server(object):
         self._client.fetch(url, _really_callback)
 
 
-class Database(Object):
+class Database(object):
     def __init__(self, server, name):
         self.server = server
         self._json_encoder = self.server._json_encoder
@@ -466,7 +466,7 @@ class Database(Object):
         def _really_callback(response):
             if response.code != 200:
                 raise _exception(response)
-            callback(True)
+            callback(json.loads(response.body.decode('utf-8')))
 
         self._fetch(
             '%s/%s?rev=%s' % (doc['_id'], attachment_name, doc['_rev']),
@@ -558,19 +558,19 @@ class Database(Object):
     def delete(self, data, callback):
         def _really_callback(response):
             try:
-                json.loads(response.body.decode('utf-8'))
+                content = json.loads(response.body.decode('utf-8'))
             except ValueError:
                 raise _exception(response)
             
             if response.code == 200:
-                callback(self)
+                callback(content)
             else:
                 raise _exception(response)
 
         # TODO/ mb add validation
         doc_id = urlquote(data['_id'], safe='')
         self._fetch(
-            '%s?rev=%s' % (doc_id, doc['_rev']),
+            '%s?rev=%s' % (doc_id, data['_rev']),
             _really_callback,
             method='DELETE',
             )
