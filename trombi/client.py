@@ -78,38 +78,6 @@ def from_uri(uri, fetch_args=None, io_loop=None, **kwargs):
     return Database(server, db_name)
 
 
-class TrombiError(object):
-    """
-    A common error class denoting an error that has happened
-    """
-    error = True
-
-
-class TrombiObject(object):
-    """
-    Dummy result for queries that really don't have anything sane to
-    return, like succesful database deletion.
-
-    """
-    error = False
-
-
-class TrombiResult(TrombiObject):
-    """
-    A generic result objects for Trombi queries that do not have any
-    formal representation.
-    """
-
-    def __init__(self, data):
-        self.content = data
-        super(TrombiResult, self).__init__()
-
-
-class TrombiDict(TrombiObject, dict):
-    def to_basetype(self):
-        return dict(self)
-
-
 def _jsonize_params(params):
     result = dict()
     for key, value in params.items():
@@ -137,10 +105,9 @@ def _exception(response):
                 #return TrombiErrorResponse(response.code, content)
 
 
-class Server(TrombiObject):
+class Server(object):
     def __init__(self, baseurl, fetch_args=None, io_loop=None,
                  json_encoder=None, **client_args):
-        self.error = False
         self.session_cookie = None
         self.baseurl = baseurl
         if self.baseurl[-1] == '/':
@@ -222,7 +189,7 @@ class Server(TrombiObject):
     def delete(self, name, callback):
         def _really_callback(response):
             if response.code == 200:
-                callback(TrombiObject())
+                callback(True))
             elif response.code == 404:
                 raise trombi_ex.TrombiNotFound('Database does not exist: %r' % name)
             else:
@@ -296,7 +263,7 @@ class Server(TrombiObject):
         def _really_callback(response):
             if response.code == 200:
                 self.session_cookie = None
-                callback(TrombiResult(json.loads(response.body)))
+                callback(json.loads(response.body))
             else:
                 raise _exception(response)
 
@@ -308,7 +275,7 @@ class Server(TrombiObject):
             if response.code in (200, 302):
                 self.session_cookie = response.headers['Set-Cookie']
                 response_body = json.loads(response.body)
-                callback(TrombiResult(response_body))
+                callback(response_body)
             else:
                 raise _exception(response)
 
@@ -321,7 +288,7 @@ class Server(TrombiObject):
         def _really_callback(response):
             if response.code == 200:
                 body = json.loads(response.body)
-                callback(TrombiResult(body))
+                callback(body)
             else:
                 raise _exception(response)
 
@@ -329,7 +296,7 @@ class Server(TrombiObject):
         self._client.fetch(url, _really_callback)
 
 
-class Database(TrombiObject):
+class Database(Object):
     def __init__(self, server, name):
         self.server = server
         self._json_encoder = self.server._json_encoder
@@ -348,7 +315,7 @@ class Database(TrombiObject):
         def _really_callback(response):
             if response.code == 200:
                 body = response.body.decode('utf-8')
-                callback(TrombiDict(json.loads(body)))
+                callback(json.loads(body))
             else:
                 raise _exception(response)
 
@@ -382,14 +349,9 @@ class Database(TrombiObject):
         else:
             attachments = {}
 
-        if isinstance(data, Document):
-            doc = data
-        else:
-            doc = Document(self, data)
-
-        if doc_id is None and doc.id is not None and doc.rev is not None:
+        if doc_id is None and data.get('_id', None) is not None and data.get('_rev', None) is not None:
             # Update the existing document
-            doc_id = doc.id
+            doc_id = data['_id']
 
         if doc_id is not None:
             url = urlquote(doc_id, safe='')
@@ -398,11 +360,14 @@ class Database(TrombiObject):
             url = ''
             method = 'POST'
 
+        if len(attachments) > 0 and '_attachments' not in data:
+            data['_attachments'] = {}
+            
         for name, attachment in attachments.items():
             content_type, attachment_data = attachment
             if content_type is None:
                 content_type = 'text/plain'
-            doc.attachments[name] = {
+            data['_attachments'][name] = {
                 'content_type': content_type,
                 'data': b64encode(attachment_data).decode('utf-8'),
                 }
@@ -419,9 +384,7 @@ class Database(TrombiObject):
                 content = response.body
 
             if response.code == 201:
-                doc.id = content['id']
-                doc.rev = content['rev']
-                callback(doc)
+                callback(content)
             else:
                 raise _exception(response)
 
@@ -429,15 +392,14 @@ class Database(TrombiObject):
             url,
             _really_callback,
             method=method,
-            body=json.dumps(doc.raw(), cls=self._json_encoder),
+            body=json.dumps(data, cls=self._json_encoder),
         )
 
     def get(self, doc_id, callback, attachments=False):
         def _really_callback(response):
             if response.code == 200:
                 data = json.loads(response.body.decode('utf-8'))
-                doc = Document(self, data)
-                callback(doc)
+                callback(data)
             #elif response.code == 404:
                 # Document doesn't exist
                 #raise trombi_ex.TrombiNotFound('Document with id `%s` not found' % doc_id)
@@ -461,6 +423,27 @@ class Database(TrombiObject):
             **kwargs
             )
 
+    def set_attachment(self, doc, name, data, callback, type='text/plain'):
+        def _really_callback(response):
+            if  response.code != 201:
+                raise _exception(response)
+            data = json.loads(response.body.decode('utf-8'))
+            assert data['id'] == doc['_id']
+            callback(data)
+
+        headers = {'Content-Type': type, 'Expect': ''}
+
+        self._fetch(
+            '%s/%s?rev=%s' % (
+                urlquote(doc['_id'], safe=''),
+                urlquote(name, safe=''),
+                doc['_rev']),
+            _really_callback,
+            method='PUT',
+            body=data,
+            headers=headers,
+            )
+            
     def get_attachment(self, doc_id, attachment_name, callback):
         def _really_callback(response):
             if response.code == 200:
@@ -479,13 +462,41 @@ class Database(TrombiObject):
             _really_callback,
             )
 
+    def delete_attachment(self, doc, attachment_name, callback):
+        def _really_callback(response):
+            if response.code != 200:
+                raise _exception(response)
+            callback(True)
+
+        self._fetch(
+            '%s/%s?rev=%s' % (doc['_id'], attachment_name, doc['_rev']),
+            _really_callback,
+            method='DELETE',
+            )
+            
+    def copy(self, doc, new_id, callback):
+        assert '_rev' in doc and '_id' in doc
+
+        def _copy_done(response):
+            if response.code != 201:
+                raise _exception(response)
+
+            content = json.loads(response.body.decode('utf-8'))
+            callback(content)
+
+        self._fetch(
+            '%s' % urlquote(doc['_id'], safe=''),
+            _copy_done,
+            allow_nonstandard_methods=True,
+            method='COPY',
+            headers={'Destination': str(new_id)}
+            )
+            
     def view(self, design_doc, viewname, callback, **kwargs):
         def _really_callback(response):
             if response.code == 200:
                 body = response.body.decode('utf-8')
-                callback(
-                    ViewResult(json.loads(body), db=self)
-                    )
+                callback(json.loads(body))
             else:
                 raise _exception(response)
 
@@ -513,7 +524,7 @@ class Database(TrombiObject):
     def list(self, design_doc, listname, viewname, callback, **kwargs):
         def _really_callback(response):
             if response.code == 200:
-                callback(TrombiResult(response.body))
+                callback(response.body)
             else:
                 raise _exception(response)
 
@@ -528,9 +539,7 @@ class Database(TrombiObject):
         def _really_callback(response):
             if response.code == 200:
                 body = response.body.decode('utf-8')
-                callback(
-                    ViewResult(json.loads(body), db=self)
-                    )
+                callback(json.loads(body))
             else:
                 raise _exception(response)
 
@@ -558,14 +567,10 @@ class Database(TrombiObject):
             else:
                 raise _exception(response)
 
-        if isinstance(data, Document):
-            doc = data
-        else:
-            doc = Document(self, data)
-
-        doc_id = urlquote(doc.id, safe='')
+        # TODO/ mb add validation
+        doc_id = urlquote(data['_id'], safe='')
         self._fetch(
-            '%s?rev=%s' % (doc_id, doc.rev),
+            '%s?rev=%s' % (doc_id, doc['_rev']),
             _really_callback,
             method='DELETE',
             )
@@ -578,7 +583,7 @@ class Database(TrombiObject):
                 except ValueError:
                     raise _exception(response)
                 else:
-                    callback(BulkResult(content))
+                    callback(content)
             else:
                 raise _exception(response)
 
@@ -611,7 +616,7 @@ class Database(TrombiObject):
                 callback(None)
             else:
                 body = response.body.decode('utf-8')
-                callback(TrombiResult(json.loads(body)))
+                callback(json.loads(body))
 
         stream_buffer = []
 
@@ -645,7 +650,7 @@ class Database(TrombiObject):
                 #
                 # This also relieves us from handling exceptions in
                 # the handler.
-                cb = functools.partial(callback, TrombiDict(obj))
+                cb = functools.partial(callback, obj)
                 self.server.io_loop.add_callback(cb)
 
         couchdb_params = kw
@@ -662,203 +667,7 @@ class Database(TrombiObject):
         log.debug('Fetching changes from %s with params %s', url, params)
         self._fetch(url, _really_callback, **params)
 
-
-class Document(collections.MutableMapping, TrombiObject):
-    def __init__(self, db, data):
-        self.db = db
-        self.data = {}
-        self.id = None
-        self.rev = None
-        self._postponed_attachments = False
-        self.attachments = {}
-
-        for key, value in data.items():
-            if key.startswith('_'):
-                setattr(self, key[1:], value)
-            else:
-                self[key] = value
-
-    def __len__(self):
-        return len(self.data)
-
-    def __iter__(self):
-        return iter(self.data)
-
-    def __contains__(self, key):
-        return key in self.data
-
-    def __getitem__(self, key):
-        return self.data[key]
-
-    def __setitem__(self, key, value):
-        if key.startswith('_'):
-            raise KeyError("Keys starting with '_' are reserved for CouchDB")
-        self.data[key] = value
-
-    def __delitem__(self, key):
-        del self.data[key]
-
-    def raw(self):
-        result = {}
-        if self.id:
-            result['_id'] = self.id
-        if self.rev:
-            result['_rev'] = self.rev
-        if self.attachments:
-            result['_attachments'] = self.attachments
-
-        result.update(self.data)
-        return result
-
-    def copy(self, new_id, callback):
-        assert self.rev and self.id
-
-        def _copy_done(response):
-            if response.code != 201:
-                raise _exception(response)
-
-            content = json.loads(response.body.decode('utf-8'))
-            doc = Document(self.db, self.data)
-            doc.attachments = self.attachments.copy()
-            doc.id = content['id']
-            doc.rev = content['rev']
-            callback(doc)
-
-        self.db._fetch(
-            '%s' % urlquote(self.id, safe=''),
-            _copy_done,
-            allow_nonstandard_methods=True,
-            method='COPY',
-            headers={'Destination': str(new_id)}
-            )
-
-    def attach(self, name, data, callback, type='text/plain'):
-        def _really_callback(response):
-            if  response.code != 201:
-                raise _exception(response)
-            data = json.loads(response.body.decode('utf-8'))
-            assert data['id'] == self.id
-            self.rev = data['rev']
-            self.attachments[name] = {
-                'content_type': type,
-                'length': len(data),
-                'stub': True,
-            }
-            callback(self)
-
-        headers = {'Content-Type': type, 'Expect': ''}
-
-        self.db._fetch(
-            '%s/%s?rev=%s' % (
-                urlquote(self.id, safe=''),
-                urlquote(name, safe=''),
-                self.rev),
-            _really_callback,
-            method='PUT',
-            body=data,
-            headers=headers,
-            )
-
-    def load_attachment(self, name, callback):
-        def _really_callback(response):
-            if response.code == 200:
-                callback(response.body)
-            else:
-                raise _exception(response)
-
-        if (hasattr(self, 'attachments') and
-            name in self.attachments and
-            not self.attachments[name].get('stub', False)):
-            data = self.attachments[name]['data'].encode('utf-8')
-            callback(b64decode(data))
-        else:
-            self.db._fetch(
-                '%s/%s' % (
-                    urlquote(self.id, safe=''),
-                    urlquote(name, safe='')
-                    ),
-                _really_callback,
-                )
-
-    def delete_attachment(self, name, callback):
-        def _really_callback(response):
-            if response.code != 200:
-                raise _exception(response)
-            callback(self)
-
-        self.db._fetch(
-            '%s/%s?rev=%s' % (self.id, name, self.rev),
-            _really_callback,
-            method='DELETE',
-            )
-
-
-class BulkError(TrombiError):
-    def __init__(self, data):
-        self.error_type = data['error']
-        self.reason = data.get('reason', None)
-        self.raw = data
-
-
-class BulkObject(TrombiObject, collections.Mapping):
-    def __init__(self, data):
-        self._data = data
-
-    def __len__(self):
-        return len(self._data)
-
-    def __iter__(self):
-        return iter(self._data)
-
-    def __contains__(self, key):
-        return key in self._data
-
-    def __getitem__(self, key):
-        return self._data[key]
-
-
-class BulkResult(TrombiResult, collections.Sequence):
-    def __init__(self, result):
-        self.content = []
-        for line in result:
-            if 'error' in line:
-                self.content.append(BulkError(line))
-            else:
-                self.content.append(BulkObject(line))
-
-    def __len__(self):
-        return len(self.content)
-
-    def __iter__(self):
-        return iter(self.content)
-
-    def __getitem__(self, key):
-        return self.content[key]
-
-
-class ViewResult(TrombiObject, collections.Sequence):
-    def __init__(self, result, db=None):
-        self.db = db
-        self.total_rows = result.get('total_rows', len(result['rows']))
-        self._rows = result['rows']
-        self.offset = result.get('offset', 0)
-
-    def _format_row(self, row):
-        if 'doc' in row and row['doc']:
-            row['doc'] = Document(self.db, row['doc'])
-        return row
-
-    def __len__(self):
-        return len(self._rows)
-
-    def __iter__(self):
-        return (self._format_row(x) for x in self._rows)
-
-    def __getitem__(self, key):
-        return self._format_row(self._rows[key])
-
-
-class Paginator(TrombiObject):
+class Paginator(object):
     """
     Provides pseudo pagination of CouchDB documents calculated from
     the total_rows and offset of a CouchDB view as well as a user-
