@@ -44,6 +44,7 @@ except ImportError:
 from base64 import b64encode, b64decode
 from tornado.httpclient import AsyncHTTPClient
 from tornado.httputil import HTTPHeaders
+from tornado import gen
 
 log = logging.getLogger('trombi')
 
@@ -126,6 +127,7 @@ class Server(object):
         self._json_encoder = json_encoder
         self._client = AsyncHTTPClient(self.io_loop, **client_args)
 
+
     def _fetch(self, *args, **kwargs):
         # This is just a convenince wrapper for _client.fetch
 
@@ -145,74 +147,63 @@ class Server(object):
 
         self._client.fetch(*args, **fetch_args)
 
+
+    @gen.engine
     def create(self, name, callback):
         if not VALID_DB_NAME.match(name):
             # Avoid additional HTTP Query by doing the check here
             raise trombi_ex.TrombiInvalidDatabaseName('Invalid database name: %r' % name)
 
-        def _create_callback(response):
-            if response.code == 201:
-                callback(Database(self, name))
-            elif response.code == 412:
-                raise trombi_ex.TrombiPreconditionFailed('Database already exists: %r' % name)
-            else:
-                raise _exception(response)
+        response = yield gen.Task(self._fetch, '%s/%s' % (self.baseurl, name), method='PUT', body='')
+        
+        if response.code == 201:
+            callback(Database(self, name))
+        elif response.code == 412:
+            raise trombi_ex.TrombiPreconditionFailed('Database already exists: %r' % name)
+        else:
+            raise _exception(response)
 
-        self._fetch(
-            '%s/%s' % (self.baseurl, name),
-            _create_callback,
-            method='PUT',
-            body='',
-            )
 
+    @gen.engine
     def get(self, name, callback, create=False):
         if not VALID_DB_NAME.match(name):
             raise trombi_ex.TrombiInvalidDatabaseName('Invalid database name: %r' % name)
 
-        def _really_callback(response):
-            if response.code == 200:
-                callback(Database(self, name))
-            elif response.code == 404:
-                # Database doesn't exist
-                if create:
-                    self.create(name, callback)
-                else:
-                    raise trombi_ex.TrombiNotFound('Database not found: %s' % name)
+        response = yield gen.Task(self._fetch, '%s/%s' % (self.baseurl, name))
+        
+        if response.code == 200:
+            callback(Database(self, name))
+        elif response.code == 404:
+            # Database doesn't exist
+            if create:
+                self.create(name, callback)
             else:
-                raise _exception(response)
+                raise trombi_ex.TrombiNotFound('Database not found: %s' % name)
+        else:
+            raise _exception(response)
 
-        self._fetch(
-            '%s/%s' % (self.baseurl, name),
-            _really_callback,
-            )
-
+    @gen.engine
     def delete(self, name, callback):
-        def _really_callback(response):
-            if response.code == 200:
-                callback(json.loads(response.body.decode('utf-8')))
-            elif response.code == 404:
-                raise trombi_ex.TrombiNotFound('Database does not exist: %r' % name)
-            else:
-                raise _exception(response)
+        response = yield gen.Task(self._fetch, '%s/%s' % (self.baseurl, name), method='DELETE')
+  
+        if response.code == 200:
+            callback(json.loads(response.body.decode('utf-8')))
+        elif response.code == 404:
+            raise trombi_ex.TrombiNotFound('Database does not exist: %r' % name)
+        else:
+            raise _exception(response)
 
-        self._fetch(
-            '%s/%s' % (self.baseurl, name),
-            _really_callback,
-            method='DELETE',
-            )
 
+    @gen.engine
     def list(self, callback):
-        def _really_callback(response):
-            if response.code == 200:
-                body = response.body.decode('utf-8')
-                callback(Database(self, x) for x in json.loads(body))
-            else:
-                raise _exception(response)
+        response = yield gen.Task(self._fetch, '%s/%s' % (self.baseurl, '_all_dbs'))
+        
+        if response.code == 200:
+            body = response.body.decode('utf-8')
+            callback(Database(self, x) for x in json.loads(body))
+        else:
+            raise _exception(response)
 
-        self._fetch(
-            '%s/%s' % (self.baseurl, '_all_dbs'),
-            _really_callback,
-            )
 
     def add_user(self, name, password, callback, doc=None):
         userdb = Database(self, '_users')
@@ -246,54 +237,52 @@ class Server(object):
         userdb = Database(self, '_users')
         userdb.set(user_doc, callback)
 
+    @gen.engine
     def update_user_password(self, username, password, callback):
-        def _really_callback(user_doc):
-            if user_doc.error:
-                callback(user_doc)
-            user_doc['password_sha'] = sha1(password + user_doc['salt']).hexdigest()
-            self.update_user(user_doc, callback)
-
-        self.get_user(username, _really_callback)
+        user_doc = yield gen.Task(self.get_user, username)
+        user_doc['password_sha'] = sha1(password + user_doc['salt']).hexdigest()
+        self.update_user(user_doc, callback)
 
     def delete_user(self, user_doc, callback):
         userdb = Database(self, '_users')
         userdb.delete(user_doc, callback)
 
+    @gen.engine
     def logout(self, callback):
-        def _really_callback(response):
-            if response.code == 200:
-                self.session_cookie = None
-                callback(json.loads(response.body))
-            else:
-                raise _exception(response)
-
         url = '%s/%s' % (self.baseurl, '_session')
-        self._client.fetch(url, _really_callback, method='DELETE')
+        reponse = yield gen.Task(self._client.fetch, url, method='DELETE')
+     
+        if response.code == 200:
+            self.session_cookie = None
+            callback(json.loads(response.body))
+        else:
+            raise _exception(response)
 
+    @gen.engine
     def login(self, username, password, callback):
-        def _really_callback(response):
-            if response.code in (200, 302):
-                self.session_cookie = response.headers['Set-Cookie']
-                response_body = json.loads(response.body)
-                callback(response_body)
-            else:
-                raise _exception(response)
-
         body = urllib.urlencode({'name': username, 'password': password})
         url = '%s/%s' % (self.baseurl, '_session')
 
-        self._client.fetch(url, _really_callback, method='POST', body=body)
+        response = yield gen.Task(self._client.fetch, url, method='POST', body=body)
+        
+        if response.code in (200, 302):
+            self.session_cookie = response.headers['Set-Cookie']
+            response_body = json.loads(response.body)
+            callback(response_body)
+        else:
+            raise _exception(response)
 
+    @gen.engine
     def session(self, callback):
-        def _really_callback(response):
-            if response.code == 200:
-                body = json.loads(response.body)
-                callback(body)
-            else:
-                raise _exception(response)
-
         url = '%s/%s' % (self.baseurl, '_session')
-        self._client.fetch(url, _really_callback)
+        response = yield gen.Task(self._client.fetch, url)
+        
+        if response.code == 200:
+            body = json.loads(response.body)
+            callback(body)
+        else:
+            raise _exception(response)
+        
 
 
 class Database(object):
@@ -311,16 +300,16 @@ class Database(object):
             url = '%s/%s' % (self.baseurl, url)
         return self.server._fetch(url, *args, **kwargs)
 
+    @gen.engine
     def info(self, callback):
-        def _really_callback(response):
-            if response.code == 200:
-                body = response.body.decode('utf-8')
-                callback(json.loads(body))
-            else:
-                raise _exception(response)
+        response = yield gen.Task(self._fetch, '')
+        if response.code == 200:
+            body = response.body.decode('utf-8')
+            callback(json.loads(body))
+        else:
+            raise _exception(response)
 
-        self._fetch('', _really_callback)
-
+    @gen.engine
     def set(self, *args, **kwargs):
         cb = kwargs.pop('callback', None)
         if cb:
@@ -372,40 +361,26 @@ class Database(object):
                 'data': b64encode(attachment_data).decode('utf-8'),
                 }
 
-        def _really_callback(response):
-            try:
-                # If the connection to the server is malfunctioning,
-                # ie. the simplehttpclient returns 599 and no body,
-                # don't set the content as the response.code will not
-                # be 201 at that point either
-                if response.body is not None:
-                    content = json.loads(response.body.decode('utf-8'))
-            except ValueError:
-                content = response.body
+        response = yield gen.Task(self._fetch, url, method=method, body=json.dumps(data, cls=self._json_encoder))
+        
+        try:
+            # If the connection to the server is malfunctioning,
+            # ie. the simplehttpclient returns 599 and no body,
+            # don't set the content as the response.code will not
+            # be 201 at that point either
+            if response.body is not None:
+                content = json.loads(response.body.decode('utf-8'))
+        except ValueError:
+            content = response.body
 
-            if response.code == 201:
-                callback(content)
-            else:
-                raise _exception(response)
+        if response.code == 201:
+            callback(content)
+        else:
+            raise _exception(response)
 
-        self._fetch(
-            url,
-            _really_callback,
-            method=method,
-            body=json.dumps(data, cls=self._json_encoder),
-        )
 
+    @gen.engine
     def get(self, doc_id, callback, attachments=False):
-        def _really_callback(response):
-            if response.code == 200:
-                data = json.loads(response.body.decode('utf-8'))
-                callback(data)
-            #elif response.code == 404:
-                # Document doesn't exist
-                #raise trombi_ex.TrombiNotFound('Document with id `%s` not found' % doc_id)
-            else:
-                raise _exception(response)
-
         doc_id = urlquote(doc_id, safe='')
 
         kwargs = {}
@@ -417,89 +392,80 @@ class Database(object):
                  'Accept': 'application/json',
              })
 
-        self._fetch(
-            doc_id,
-            _really_callback,
-            **kwargs
-            )
-
-    def set_attachment(self, doc, name, data, callback, type='text/plain'):
-        def _really_callback(response):
-            if  response.code != 201:
-                raise _exception(response)
+        response = yield gen.Task(self._fetch, doc_id, **kwargs)
+        
+        if response.code == 200:
             data = json.loads(response.body.decode('utf-8'))
-            assert data['id'] == doc['_id']
             callback(data)
+            #elif response.code == 404:
+                # Document doesn't exist
+                #raise trombi_ex.TrombiNotFound('Document with id `%s` not found' % doc_id)
+        else:
+            raise _exception(response)
 
+
+    @gen.engine
+    def set_attachment(self, doc, name, data, callback, type='text/plain'):
         headers = {'Content-Type': type, 'Expect': ''}
 
-        self._fetch(
+        response = yield gen.Task(self._fetch,
             '%s/%s?rev=%s' % (
                 urlquote(doc['_id'], safe=''),
                 urlquote(name, safe=''),
                 doc['_rev']),
-            _really_callback,
             method='PUT',
             body=data,
-            headers=headers,
-            )
-            
-    def get_attachment(self, doc_id, attachment_name, callback):
-        def _really_callback(response):
-            if response.code == 200:
-                callback(response.body)
-            #elif response.code == 404:
-                # Document or attachment doesn't exist
-                #callback(None)
-            else:
-                raise _exception(response)
+            headers=headers)
+        
+        if response.code != 201:
+            raise _exception(response)
+        
+        data = json.loads(response.body.decode('utf-8'))
+        assert data['id'] == doc['_id']
+        callback(data)
+        
 
+    @gen.engine    
+    def get_attachment(self, doc_id, attachment_name, callback):
         doc_id = urlquote(doc_id, safe='')
         attachment_name = urlquote(attachment_name, safe='')
 
-        self._fetch(
-            '%s/%s' % (doc_id, attachment_name),
-            _really_callback,
-            )
+        response = yield gen.Task(self._fetch, '%s/%s' % (doc_id, attachment_name))
+ 
+        if response.code == 200:
+            callback(response.body)
+            #elif response.code == 404:
+                # Document or attachment doesn't exist
+                #callback(None)
+        else:
+            raise _exception(response)
 
+    @gen.engine
     def delete_attachment(self, doc, attachment_name, callback):
-        def _really_callback(response):
-            if response.code != 200:
-                raise _exception(response)
-            callback(json.loads(response.body.decode('utf-8')))
+        response = yield gen.Task(self._fetch, '%s/%s?rev=%s' % (doc['_id'], attachment_name, doc['_rev']), method='DELETE')
+ 
+        if response.code != 200:
+            raise _exception(response)
+        callback(json.loads(response.body.decode('utf-8')))
+        
 
-        self._fetch(
-            '%s/%s?rev=%s' % (doc['_id'], attachment_name, doc['_rev']),
-            _really_callback,
-            method='DELETE',
-            )
-            
+    @gen.engine    
     def copy(self, doc, new_id, callback):
-        assert '_rev' in doc and '_id' in doc
-
-        def _copy_done(response):
-            if response.code != 201:
-                raise _exception(response)
-
-            content = json.loads(response.body.decode('utf-8'))
-            callback(content)
-
-        self._fetch(
+        response = yield gen.Task(self._fetch,
             '%s' % urlquote(doc['_id'], safe=''),
-            _copy_done,
             allow_nonstandard_methods=True,
             method='COPY',
-            headers={'Destination': str(new_id)}
-            )
-            
-    def view(self, design_doc, viewname, callback, **kwargs):
-        def _really_callback(response):
-            if response.code == 200:
-                body = response.body.decode('utf-8')
-                callback(json.loads(body))
-            else:
-                raise _exception(response)
+            headers={'Destination': str(new_id)})
 
+        if response.code != 201:
+            raise _exception(response)
+
+        content = json.loads(response.body.decode('utf-8'))
+        callback(content)
+
+            
+    @gen.engine
+    def view(self, design_doc, viewname, callback, **kwargs):
         if not design_doc and viewname == '_all_docs':
             url = '_all_docs'
         else:
@@ -514,35 +480,34 @@ class Database(object):
             url = '%s?%s' % (url, _jsonize_params(kwargs))
 
         if keys is not None:
-            self._fetch(url, _really_callback,
+            response = yield gen.Task(self._fetch,url,
                         method='POST',
                         body=json.dumps({'keys': keys})
                         )
         else:
-            self._fetch(url, _really_callback)
+            response = yield gen.Task(self._fetch,url)
 
+        if response.code == 200:
+            body = response.body.decode('utf-8')
+            callback(json.loads(body))
+        else:
+            raise _exception(response)
+
+    @gen.engine
     def list(self, design_doc, listname, viewname, callback, **kwargs):
-        def _really_callback(response):
-            if response.code == 200:
-                callback(response.body)
-            else:
-                raise _exception(response)
-
         url = '_design/%s/_list/%s/%s/' % (design_doc, listname, viewname)
         if kwargs:
             url = '%s?%s' % (url, _jsonize_params(kwargs))
 
-        self._fetch(url, _really_callback)
+        response = yield gen.Task(self._fetch, url)
+        if response.code == 200:
+            callback(response.body)
+        else:
+            raise _exception(response)
 
+    @gen.engine
     def temporary_view(self, callback, map_fun, reduce_fun=None,
                        language='javascript', **kwargs):
-        def _really_callback(response):
-            if response.code == 200:
-                body = response.body.decode('utf-8')
-                callback(json.loads(body))
-            else:
-                raise _exception(response)
-
         url = '_temp_view'
         if kwargs:
             url = '%s?%s' % (url, _jsonize_params(kwargs))
@@ -551,42 +516,39 @@ class Database(object):
         if reduce_fun:
             body['reduce'] = reduce_fun
 
-        self._fetch(url, _really_callback, method='POST',
+        response = yield gen.Task(self._fetch,url, method='POST',
                     body=json.dumps(body),
                     headers={'Content-Type': 'application/json'})
 
-    def delete(self, data, callback):
-        def _really_callback(response):
-            try:
-                content = json.loads(response.body.decode('utf-8'))
-            except ValueError:
-                raise _exception(response)
-            
-            if response.code == 200:
-                callback(content)
-            else:
-                raise _exception(response)
+        if response.code == 200:
+            body = response.body.decode('utf-8')
+            callback(json.loads(body))
+        else:
+            raise _exception(response)
 
+
+    @gen.engine
+    def delete(self, data, callback):
         # TODO/ mb add validation
         doc_id = urlquote(data['_id'], safe='')
-        self._fetch(
+        response = yield gen.Task(self._fetch,
             '%s?rev=%s' % (doc_id, data['_rev']),
-            _really_callback,
             method='DELETE',
             )
+         
+        try:
+            content = json.loads(response.body.decode('utf-8'))
+        except ValueError:
+            raise _exception(response)
 
+        if response.code == 200:
+            callback(content)
+        else:
+            raise _exception(response)
+
+
+    @gen.engine
     def bulk_docs(self, data, callback, all_or_nothing=False):
-        def _really_callback(response):
-            if response.code == 200 or response.code == 201:
-                try:
-                    content = json.loads(response.body.decode('utf-8'))
-                except ValueError:
-                    raise _exception(response)
-                else:
-                    callback(content)
-            else:
-                raise _exception(response)
-
         docs = []
         for element in data:
             if isinstance(element, Document):
@@ -598,26 +560,21 @@ class Database(object):
         if all_or_nothing is True:
             payload['all_or_nothing'] = True
 
-        self._fetch(
-            '_bulk_docs',
-            _really_callback,
-            method='POST',
-            body=json.dumps(payload),
-            )
-
-    def changes(self, callback, timeout=None, feed='normal', **kw):
-        def _really_callback(response):
-            log.debug('Changes feed response: %s', response)
-            if response.code != 200:
+        response = yield gen.Task(self._fetch, '_bulk_docs', method='POST', body=json.dumps(payload))
+ 
+        if response.code == 200 or response.code == 201:
+            try:
+                content = json.loads(response.body.decode('utf-8'))
+            except ValueError:
                 raise _exception(response)
-            if feed == 'continuous':
-                # Feed terminated, call callback with None to indicate
-                # this, if the mode is continous
-                callback(None)
             else:
-                body = response.body.decode('utf-8')
-                callback(json.loads(body))
+                callback(content)
+        else:
+            raise _exception(response)
 
+
+    @gen.engine
+    def changes(self, callback, timeout=None, feed='normal', **kw):
         stream_buffer = []
 
         def _stream(text):
@@ -665,7 +622,19 @@ class Database(object):
             params['streaming_callback'] = _stream
 
         log.debug('Fetching changes from %s with params %s', url, params)
-        self._fetch(url, _really_callback, **params)
+        response = yield gen.Task(self._fetch, url, **params)
+
+        log.debug('Changes feed response: %s', response)
+        if response.code != 200:
+            raise _exception(response)
+        if feed == 'continuous':
+            # Feed terminated, call callback with None to indicate
+            # this, if the mode is continous
+            callback(None)
+        else:
+            body = response.body.decode('utf-8')
+            callback(json.loads(body))
+
 
 class Paginator(object):
     """
@@ -690,7 +659,9 @@ class Paginator(object):
         self.page_range = None
         self.start_doc_id = None
         self.end_doc_id = None
-
+ 
+    # Dirty hack
+    @gen.engine
     def get_page(self, design_doc, viewname, callback,
             key=None, doc_id=None, forward=True, **kw):
         """
@@ -755,7 +726,8 @@ class Paginator(object):
             kwargs['descending'] = False if kwargs['descending'] else True
             kwargs['skip'] = 1
 
-        self._db.view(design_doc, viewname, _really_callback, **kwargs)
+        response = yield gen.Taskself(self._db.view, design_doc, viewname, **kwargs)
+        _really_callback(response)
 
 
 VALID_DB_NAME = re.compile(r'^[a-z][a-z0-9_$()+-/]*$')
