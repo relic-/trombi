@@ -1,10 +1,18 @@
 import trombi
 from tornado.ioloop import IOLoop
+from tornado import gen
 
+@gen.engine
 def main():
     main.server = trombi.Server('http://localhost:5984')
     print('[*] Getting/ Creating db')
-    main.server.get('testdb', database_created, create=True)
+    try:
+        db=yield gen.Task(main.server.get, 'testdb', create=True)
+        database_created(db)
+    except Exception as e:
+        print(e)
+        IOLoop.instance().stop()
+
 main.db = None
 main.server = None
 
@@ -13,9 +21,10 @@ def changes(res):
 
 def database_created(db):
     main.db = db
-    #main.db.changes(changes)
+    main.db.changes(changes)
     print('[*] Static view')
-    main.db.view('test', 'test', view_get)
+    view_get(None)
+    #main.db.view('test', 'test', view_get)
 
 
 def view_get(res):
@@ -57,6 +66,8 @@ def del_attachment(res):
     print('[*] Deleting document')
     def _del_att(res):
         print(res)
+        main.db.changes(changes)
+        main.db.changes(changes)
         delete_database()
     main.db.delete(dict(_id=res['id'], _rev=res['rev']),_del_att)
 
