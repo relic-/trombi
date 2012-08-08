@@ -5,6 +5,27 @@ Trombi is an asynchronous CouchDB_ client for Tornado_.
 
 *trombi* is Finnish for a small tornado, occuring in Europe.
 
+Rationale behind fork:
+* Simplified easy doc access
+* Support for exceptions
+
+**NOTICE**
+Due to exceptions being raised workflow with passing callbacks won't work
+
+
+Difference from inoi/trombi
+---------------------------
+
+* Removed additional layer (everything works on dicts)
+  * Document/ViewResult/ BulkResult classes
+* Replaced error objects (returning error objects) with exceptions for use with **tornado.gen**
+
+TODO
+----
+* Add gen.engine in *trombi.client* for correct exception propagation
+* Documentation
+* Examples
+* Unittests
 
 Requirements
 ------------
